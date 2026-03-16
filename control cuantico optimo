@@ -1,0 +1,372 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import matplotlib.animation as animation
+
+# =========================================================
+# 1. RED NEURONAL BASE
+# =========================================================
+
+class NLS_Net(nn.Module):
+    
+    def __init__(self, layers):
+        super().__init__()
+        
+        self.activation = nn.Tanh()
+        self.linears = nn.ModuleList(
+            [nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)]
+        )
+        
+    def forward(self, x):
+        
+        for i in range(len(self.linears)-1):
+            x = self.activation(self.linears[i](x))
+            
+        return self.linears[-1](x)
+
+# =========================================================
+# 2. PINN DE CONTROL CUÁNTICO
+# =========================================================
+
+class PINN_Control_Cuantico:
+    
+    def __init__(self):
+        
+        capas_psi = [2,64,64,64,64,2]
+        self.net_psi = NLS_Net(capas_psi)
+
+        capas_control = [1,32,32,32,1]
+        self.net_control = NLS_Net(capas_control)
+
+        parametros = list(self.net_psi.parameters()) + list(self.net_control.parameters())
+
+        self.optimizer = torch.optim.Adam(parametros, lr=1e-3)
+
+    # -----------------------------------------------------
+
+    def net_f(self,x,t):
+
+        x.requires_grad_(True)
+        t.requires_grad_(True)
+
+        psi = self.net_psi(torch.cat([x,t],dim=1))
+
+        psi_R = psi[:,0:1]
+        psi_I = psi[:,1:2]
+
+        u = self.net_control(t)
+
+        psi_R_t = torch.autograd.grad(psi_R,t,torch.ones_like(psi_R),create_graph=True)[0]
+        psi_I_t = torch.autograd.grad(psi_I,t,torch.ones_like(psi_I),create_graph=True)[0]
+
+        psi_R_x = torch.autograd.grad(psi_R,x,torch.ones_like(psi_R),create_graph=True)[0]
+        psi_R_xx = torch.autograd.grad(psi_R_x,x,torch.ones_like(psi_R_x),create_graph=True)[0]
+
+        psi_I_x = torch.autograd.grad(psi_I,x,torch.ones_like(psi_I),create_graph=True)[0]
+        psi_I_xx = torch.autograd.grad(psi_I_x,x,torch.ones_like(psi_I_x),create_graph=True)[0]
+
+        f_R = psi_I_t + psi_R_xx + u*x*psi_R
+        f_I = -psi_R_t + psi_I_xx + u*x*psi_I
+
+        return f_R,f_I
+
+    # -----------------------------------------------------
+
+    def compute_loss(self,
+                     x_f,t_f,
+                     x_b,t_b,
+                     x_ini,t_ini,phi_1,
+                     x_fin,t_fin,phi_2,
+                     x_norm,t_norm):
+
+        # PDE
+        f_R,f_I = self.net_f(x_f,t_f)
+        loss_f = torch.mean(f_R**2 + f_I**2)
+
+        # frontera
+        psi_b = self.net_psi(torch.cat([x_b,t_b],dim=1))
+        loss_b = torch.mean(psi_b**2)
+
+        # inicial
+        psi_ini = self.net_psi(torch.cat([x_ini,t_ini],dim=1))
+        psi_R_ini = psi_ini[:,0:1]
+        psi_I_ini = psi_ini[:,1:2]
+
+        loss_ini = torch.mean((psi_R_ini-phi_1)**2 + psi_I_ini**2)
+
+        # final
+        psi_fin = self.net_psi(torch.cat([x_fin,t_fin],dim=1))
+        psi_R_fin = psi_fin[:,0:1]
+        psi_I_fin = psi_fin[:,1:2]
+
+        loss_fin = torch.mean((psi_R_fin-phi_2)**2 + psi_I_fin**2)
+
+        # --------------------------------------------------
+        # CONSERVACIÓN DE NORMA
+        # --------------------------------------------------
+
+        psi_norm = self.net_psi(torch.cat([x_norm,t_norm],dim=1))
+
+        psi_R = psi_norm[:,0:1]
+        psi_I = psi_norm[:,1:2]
+
+        prob = psi_R**2 + psi_I**2
+
+        norma = torch.mean(prob)
+
+        loss_norm = (norma - 1.0)**2
+
+        # --------------------------------------------------
+
+        return loss_f + 10*loss_b + 10*loss_ini + 10*loss_fin + 5*loss_norm
+
+
+# =========================================================
+# 3. GENERACIÓN DE DATOS
+# =========================================================
+
+print("Generando datos...")
+
+T_final = 2.0
+
+N_f = 5000
+N_b = 1000
+N_ini = 1000
+N_fin = 1000
+N_norm = 2000
+
+x_f = torch.rand(N_f,1)
+t_f = torch.rand(N_f,1)*T_final
+
+t_b_rand = torch.rand(N_b,1)*T_final
+
+x_b0 = torch.zeros(N_b,1)
+x_b1 = torch.ones(N_b,1)
+
+x_b = torch.cat([x_b0,x_b1],0)
+t_b = torch.cat([t_b_rand,t_b_rand],0)
+
+x_ini = torch.rand(N_ini,1)
+t_ini = torch.zeros(N_ini,1)
+
+phi_1 = math.sqrt(2.0)*torch.sin(math.pi*x_ini)
+
+x_fin = torch.rand(N_fin,1)
+t_fin = torch.ones(N_fin,1)*T_final
+
+phi_2 = math.sqrt(2.0)*torch.sin(2*math.pi*x_fin)
+
+# puntos para normalización
+
+x_norm = torch.rand(N_norm,1)
+t_norm = torch.rand(N_norm,1)*T_final
+
+
+# =========================================================
+# 4. ENTRENAMIENTO
+# =========================================================
+
+modelo = PINN_Control_Cuantico()
+
+epochs = 15000
+
+print("Entrenando red...")
+
+for ep in range(epochs):
+
+    modelo.optimizer.zero_grad()
+
+    loss = modelo.compute_loss(
+        x_f,t_f,
+        x_b,t_b,
+        x_ini,t_ini,phi_1,
+        x_fin,t_fin,phi_2,
+        x_norm,t_norm
+    )
+
+    loss.backward()
+    modelo.optimizer.step()
+
+    if ep % 500 == 0:
+        print(ep, loss.item())
+
+
+# =========================================================
+# 5. GRÁFICAS
+# =========================================================
+
+print("Generando gráficas...")
+
+t_plot = torch.linspace(0,T_final,500).view(-1,1)
+x_plot = torch.linspace(0,1,200).view(-1,1)
+
+with torch.no_grad():
+
+    u_laser = modelo.net_control(t_plot)
+
+    dt = T_final/(len(t_plot)-1)
+
+    energia = torch.sum(u_laser**2)*dt
+
+    print("Energía láser =", energia.item())
+
+    psi_ini = modelo.net_psi(torch.cat([x_plot,torch.zeros_like(x_plot)],1))
+    psi_fin = modelo.net_psi(torch.cat([x_plot,torch.ones_like(x_plot)*T_final],1))
+
+    prob_ini = psi_ini[:,0]**2 + psi_ini[:,1]**2
+    prob_fin = psi_fin[:,0]**2 + psi_fin[:,1]**2
+
+
+prob1 = (math.sqrt(2)*np.sin(math.pi*x_plot.numpy()))**2
+prob2 = (math.sqrt(2)*np.sin(2*math.pi*x_plot.numpy()))**2
+
+
+fig,axs = plt.subplots(1,3,figsize=(15,4))
+
+axs[0].plot(t_plot.numpy(),u_laser.numpy(),color='purple')
+axs[0].set_title(f"Láser (energía={energia.item():.2f})")
+axs[0].grid()
+
+axs[1].plot(x_plot.numpy(),prob_ini.numpy(),label="PINN")
+axs[1].plot(x_plot.numpy(),prob1,'--',label="Exacta")
+axs[1].set_title("Estado inicial")
+axs[1].legend()
+
+axs[2].plot(x_plot.numpy(),prob_fin.numpy(),label="PINN")
+axs[2].plot(x_plot.numpy(),prob2,'--',label="Exacta")
+axs[2].set_title("Estado final")
+axs[2].legend()
+
+plt.show()
+
+# =========================================================
+# 6. GIF
+# =========================================================
+
+print("Creando GIF...")
+
+num_frames = 120
+
+x_grid = torch.linspace(0,1,200).view(-1,1)
+
+# tiempo comprimido para el GIF
+t_grid_compreso = torch.linspace(0,T_final,num_frames)
+
+probabilidades = []
+laser_vals = []
+
+with torch.no_grad():
+
+    for t_val in t_grid_compreso:
+
+        t_tensor = torch.ones_like(x_grid)*t_val
+
+        psi = modelo.net_psi(torch.cat([x_grid,t_tensor],1))
+
+        prob = psi[:,0]**2 + psi[:,1]**2
+
+        probabilidades.append(prob.numpy())
+
+        u = modelo.net_control(torch.tensor([[t_val]]))
+        laser_vals.append(u.item())
+
+
+# ---------------------------------------------------------
+# FIGURA
+# ---------------------------------------------------------
+
+fig,(ax1,ax2) = plt.subplots(
+    2,1,
+    figsize=(8,6),
+    gridspec_kw={'height_ratios':[3,1]}
+)
+
+# onda
+linea_onda, = ax1.plot([],[],lw=2)
+
+# laser
+linea_laser, = ax2.plot([],[],color='purple')
+punto_laser, = ax2.plot([],[],'ro')
+
+ax1.set_xlim(0,1)
+ax1.set_ylim(0,2.5)
+
+ax1.set_title("Evolución de la función de onda")
+
+ax2.set_xlim(0,T_final)
+ax2.set_ylim(min(laser_vals)*1.2,max(laser_vals)*1.2)
+
+ax2.set_title("Campo láser aprendido")
+
+# ---------------------------------------------------------
+# TEXTO DEL TIEMPO
+# ---------------------------------------------------------
+
+time_text = ax1.text(
+    0.5,
+    2.2,
+    '',
+    fontsize=12,
+    horizontalalignment='center',
+    fontweight='bold'
+)
+
+# ---------------------------------------------------------
+# FUNCIÓN DE ANIMACIÓN
+# ---------------------------------------------------------
+
+def update_gif(frame):
+
+    # actualizar onda
+    linea_onda.set_data(x_grid.numpy(), probabilidades[frame])
+
+    # actualizar laser
+    tiempo_actual = t_grid_compreso[:frame+1].numpy()
+    laser_actual = laser_vals[:frame+1]
+
+    linea_laser.set_data(tiempo_actual, laser_actual)
+
+    punto_laser.set_data(
+        [t_grid_compreso[frame].item()],
+        [laser_vals[frame]]
+    )
+
+    # actualizar texto
+    time_text.set_text(
+        f"Tiempo t = {t_grid_compreso[frame].item():.3f} s"
+    )
+
+    return linea_onda, linea_laser, punto_laser, time_text
+
+
+# ---------------------------------------------------------
+# CREAR GIF
+# ---------------------------------------------------------
+
+print("Generando y guardando el GIF...")
+
+ani = animation.FuncAnimation(
+    fig,
+    update_gif,
+    frames=num_frames,
+    interval=50,
+    blit=True
+)
+
+nombre_archivo_gif = "salto_cuantico_estirado.gif"
+
+ani.save(
+    nombre_archivo_gif,
+    writer='pillow',
+    fps=20
+)
+
+print(f"GIF guardado como '{nombre_archivo_gif}'")
+
+plt.close()
+
