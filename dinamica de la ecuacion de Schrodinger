@@ -1,0 +1,157 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. DEFINICIÓN DE LA RED NEURONAL
+# ==========================================
+class NLS_Net(nn.Module):
+    def __init__(self, layers):
+        super(NLS_Net, self).__init__()
+        self.activation = nn.Tanh()
+        self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
+        
+    def forward(self, x, t):
+        inputs = torch.cat([x, t], axis=1)
+        a = inputs
+        for i in range(len(self.linears)-1):
+            a = self.activation(self.linears[i](a))
+        outputs = self.linears[-1](a)
+        
+        u = outputs[:, 0:1]
+        v = outputs[:, 1:2]
+        return u, v
+
+# ==========================================
+# 2. DEFINICIÓN DEL MODELO FÍSICO (PINN)
+# ==========================================
+class PINN_Schrodinger:
+    def __init__(self, layers):
+        self.net = NLS_Net(layers)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.001)
+
+    def net_f(self, x, t):
+        x.requires_grad_(True)
+        t.requires_grad_(True)
+        
+        u, v = self.net(x, t)
+        
+        u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        v_t = torch.autograd.grad(v, t, grad_outputs=torch.ones_like(v), create_graph=True)[0]
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        v_x = torch.autograd.grad(v, x, grad_outputs=torch.ones_like(v), create_graph=True)[0]
+        
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        v_xx = torch.autograd.grad(v_x, x, grad_outputs=torch.ones_like(v_x), create_graph=True)[0]
+        
+        # (Después de calcular u_xx y v_xx...)
+        
+        # 1. Definimos el potencial como un tensor de PyTorch
+        V = 0.5 * (x ** 2)
+        
+        # 2. Ecuación Lineal: cambiamos el término (+ |h|^2 * h) por (- V * h)
+        f_u = -v_t + 0.5 * u_xx - V * u
+        f_v =  u_t + 0.5 * v_xx - V * v
+        
+        return f_u, f_v
+
+    def compute_loss(self, x_0, t_0, u_0, v_0, x_b_lb, x_b_ub, t_b, x_f, t_f):
+        u_pred_0, v_pred_0 = self.net(x_0, t_0)
+        mse_0 = torch.mean((u_pred_0 - u_0)**2 + (v_pred_0 - v_0)**2)
+        
+        x_b_lb.requires_grad_(True)
+        x_b_ub.requires_grad_(True)
+        
+        u_lb, v_lb = self.net(x_b_lb, t_b) 
+        u_ub, v_ub = self.net(x_b_ub, t_b) 
+        
+        u_x_lb = torch.autograd.grad(u_lb, x_b_lb, grad_outputs=torch.ones_like(u_lb), create_graph=True)[0]
+        v_x_lb = torch.autograd.grad(v_lb, x_b_lb, grad_outputs=torch.ones_like(v_lb), create_graph=True)[0]
+        u_x_ub = torch.autograd.grad(u_ub, x_b_ub, grad_outputs=torch.ones_like(u_ub), create_graph=True)[0]
+        v_x_ub = torch.autograd.grad(v_ub, x_b_ub, grad_outputs=torch.ones_like(v_ub), create_graph=True)[0]
+        
+        mse_b = torch.mean((u_lb - u_ub)**2 + (v_lb - v_ub)**2) + \
+                torch.mean((u_x_lb - u_x_ub)**2 + (v_x_lb - v_x_ub)**2)
+                
+        f_u, f_v = self.net_f(x_f, t_f)
+        mse_f = torch.mean(f_u**2 + f_v**2)
+        
+        return mse_0 + mse_b + mse_f
+
+    # ¡FÍJATE QUE AHORA SÍ ESTÁ INDENTADO DENTRO DE LA CLASE!
+    def train(self, epochs, x_0, t_0, u_0, v_0, x_b_lb, x_b_ub, t_b, x_f, t_f):
+        loss_history = []
+        for epoch in range(epochs):
+            self.optimizer.zero_grad()
+            loss = self.compute_loss(x_0, t_0, u_0, v_0, x_b_lb, x_b_ub, t_b, x_f, t_f)
+            loss.backward()
+            self.optimizer.step()
+            
+            loss_history.append(loss.item())
+            if epoch % 100 == 0:
+                print(f"Epoch: {epoch}, Loss: {loss.item():.5f}")
+        return loss_history
+
+# ==========================================
+# 3. GENERACIÓN DE DATOS (NUEVO)
+# ==========================================
+print("Generando datos de entrenamiento...")
+# Puntos de Colocación en todo el dominio (para que aprenda la física)
+N_f = 20000
+x_f = torch.empty(N_f, 1).uniform_(-5, 5)
+t_f = torch.empty(N_f, 1).uniform_(0, np.pi/2)
+
+# Condición Inicial (t=0): h(0,x) = 2 sech(x)
+N_0 = 50
+x_0 = torch.empty(N_0, 1).uniform_(-5, 5)
+t_0 = torch.zeros(N_0, 1)
+# La forma natural de la onda en una parábola es una campana de Gauss
+u_0 = torch.exp(-0.5 * (x_0 ** 2)) 
+v_0 = torch.zeros_like(x_0)
+
+# Condiciones de Frontera Periódica (x = -5 y x = 5)
+N_b = 50
+t_b = torch.empty(N_b, 1).uniform_(0, np.pi/2)
+x_b_lb = torch.full_like(t_b, -5.0) # Límite inferior
+x_b_ub = torch.full_like(t_b, 5.0)  # Límite superior
+
+
+# ==========================================
+# 4. ENTRENAMIENTO Y EJECUCIÓN
+# ==========================================
+# ¡Aquí creamos el OBJETO! 
+capas = [2, 50, 50, 50, 50, 2] # 2 entradas, 4 capas ocultas, 2 salidas
+modelo_pinn = PINN_Schrodinger(capas)
+
+# Entrenamos (ponemos pocas epochs para probar, el paper usa decenas de miles)
+print("Iniciando entrenamiento...")
+historial = modelo_pinn.train(1000, x_0, t_0, u_0, v_0, x_b_lb, x_b_ub, t_b, x_f, t_f)
+
+# ==========================================
+# 5. VISUALIZACIÓN
+# ==========================================
+print("Generando gráfico...")
+x_flat = np.linspace(-5, 5, 256)
+t_flat = np.linspace(0, np.pi/2, 100)
+X, T = np.meshgrid(x_flat, t_flat)
+
+x_test = torch.tensor(X.flatten()[:, None], dtype=torch.float32)
+t_test = torch.tensor(T.flatten()[:, None], dtype=torch.float32)
+
+with torch.no_grad():
+    # Usamos el objeto 'modelo_pinn' y llamamos a '.net'
+    u_pred, v_pred = modelo_pinn.net(x_test, t_test)
+
+u = u_pred.numpy()
+v = v_pred.numpy()
+h_mag = np.sqrt(u**2 + v**2)
+H_mag = h_mag.reshape(X.shape)
+
+plt.figure(figsize=(10, 6))
+grafico = plt.pcolormesh(T, X, H_mag, shading='auto', cmap='inferno')
+plt.colorbar(grafico, label='Magnitud |h(x,t)|')
+plt.xlabel('Tiempo (t)')
+plt.ylabel('Posición (x)')
+plt.title('Dinámica de la Ecuación de Schrödinger (PINN)')
+plt.show()
