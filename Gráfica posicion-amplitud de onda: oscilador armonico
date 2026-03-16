@@ -1,0 +1,135 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+class NLS_Net(nn.Module):
+    def __init__(self, layers):
+        
+        super(NLS_Net, self).__init__()
+        self.activation = nn.Tanh()
+        self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
+        
+    def forward(self, x):
+       
+        for i in range(len(self.linears)-1):
+            x = self.activation(self.linears[i](x))
+        outputs = self.linears[-1](x)
+        u=outputs
+        
+        return u
+    
+class PINN_Schrodinger:
+    def __init__(self, layers, E_fijo,L):
+        
+        self.net = NLS_Net(layers)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.005)
+        self.E=E_fijo
+        self.L=L
+        
+    def net_f(self, x): #ecuación diferencial
+    
+        x.requires_grad_(True)
+        u = self.net(x)
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        f_u=self.E*u+(1/2)*u_xx-(1/2)*(x**2)*u
+       
+        return f_u
+    def compute_loss(self,x_f,x_fronteras):
+        f_u=self.net_f(x_f)
+        mse_f=torch.mean(f_u**2)
+        
+        u_fronteras=self.net(x_fronteras)
+        mse_u=torch.mean((u_fronteras-(math.pi)**(-1/4)*np.exp((-x_fronteras**2)/2))**2)
+        
+        #condición de normalización
+        u_f=self.net(x_f) #llama a la función forward
+        
+        dx = 4* self.L / len(x_f) 
+        
+        # 2. Sumamos el área de todos los rectángulos (Base * Altura)
+        area_total = torch.sum(u_f ** 2) * dx
+        # 3. La regla cuántica se mantiene intacta: el área debe ser 100% (1.0)
+        mse_norm = (area_total - 1.0) ** 2
+        loss = mse_u+mse_f+mse_norm
+        
+        return loss
+    
+    def train(self,epochs,x_f, x_fronteras):
+        loss_history=[]
+        for ep in range(epochs):
+            
+            self.optimizer.zero_grad()
+            loss=self.compute_loss(x_f,x_fronteras)
+            loss.backward()
+            self.optimizer.step()
+            loss_history.append(loss.item())
+            
+            if ep % 100 == 0:
+                print(f"Epoch: {ep}, Loss: {loss.item():.5f}")
+                
+        return loss_history
+    
+    
+L=math.pi
+N_f = 5000 
+x_f = torch.empty(N_f, 1).uniform_(-2*L, 2*L)
+x_fronteras=torch.tensor([[-2*L],[2*L]],dtype=torch.float32)
+
+x_test = torch.linspace(-2*L, 2*L, 500).view(-1, 1)
+plt.figure(figsize=(8, 5))
+
+#con n=0
+n=0
+E_conocida=(n+1/2)
+capas=[1,50,50,50,50,1]
+modelo=PINN_Schrodinger(capas,E_conocida, L)
+
+print("entrendando la red")
+historial=modelo.train(epochs=2000,x_f=x_f,x_fronteras=x_fronteras)
+
+
+with torch.no_grad():
+    u_pred = modelo.net(x_test)
+    
+plt.plot(x_test.numpy(), u_pred.numpy(), label="E=1/2", color='yellow')
+plt.plot(x_test.numpy(),(1/2)*x_test.numpy()**2,label="potencial",color="black")
+plt.plot(x_test.numpy(),(math.pi)**(-1/4)*np.exp((-x_test.numpy()**2)/2), '--', label="Solución Exacta Teórica", color='red')
+
+#con n=1
+n=1
+E_conocida=(n+1/2)
+modelo=PINN_Schrodinger(capas,E_conocida, L)
+
+print("entrendando la red")
+historial=modelo.train(epochs=2500,x_f=x_f,x_fronteras=x_fronteras)
+
+
+with torch.no_grad():
+    u_pred = modelo.net(x_test)
+    
+plt.plot(x_test.numpy(), u_pred.numpy(), label="E=3/2", color='blue')
+
+#con n=2
+n=2
+E_conocida=(n+1/2)
+modelo=PINN_Schrodinger(capas,E_conocida, L)
+
+print("entrendando la red")
+historial=modelo.train(epochs=2500,x_f=x_f,x_fronteras=x_fronteras)
+
+
+with torch.no_grad():
+    u_pred = modelo.net(x_test)
+    
+plt.plot(x_test.numpy(), u_pred.numpy(), label="E=5/2", color='purple')
+plt.title("oscilador armónico")
+plt.xlabel("Posición (x)")
+plt.ylabel("Amplitud de onda (u)")
+plt.legend()
+plt.grid()
+plt.xlim(-2*L,2*L)
+plt.ylim(-L,L)
+plt.show()
